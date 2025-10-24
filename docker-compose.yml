@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  # FastAPI Backend
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: multiagent-api
+    ports:
+      - "8000:8000"
+    environment:
+      # Groq API
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GROQ_MODEL=${GROQ_MODEL:-llama-3.3-70b-versatile}
+      
+      # AWS Credentials
+      - AWS_ACCESS_KEY=${AWS_ACCESS_KEY}
+      - AWS_SECRET_KEY=${AWS_SECRET_KEY}
+      
+      # DeepSeek API
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      
+      # Serper API (for news agent)
+      - SERPER_API_KEY=${SERPER_API_KEY}
+      
+      # OpenWeather API
+      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY}
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json:ro  # Google OAuth credentials (if using email agent)
+      - ./token.json:/app/token.json  # Google OAuth token
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - agent-network
+
+  # Optional: Redis for session management (recommended for production)
+  redis:
+    image: redis:7-alpine
+    container_name: multiagent-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    networks:
+      - agent-network
+
+  # Optional: Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: multiagent-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro  # SSL certificates
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks:
+      - agent-network
+
+networks:
+  agent-network:
+    driver: bridge
+
+volumes:
+  redis-data:
