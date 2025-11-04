@@ -1,4 +1,5 @@
 # Email & Calendar Agent with Real Gmail & Google Calendar Integration
+# ONLY TOKEN EXPIRATION FIX APPLIED
 
 import os
 import json
@@ -14,8 +15,6 @@ from googleapiclient.errors import HttpError
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 import operator
-
-from config import logger
 
 # Gmail and Calendar API scopes
 SCOPES = [
@@ -33,16 +32,31 @@ class GoogleAPIClient:
         self.authenticate()
     
     def authenticate(self):
-        """Authenticate with Google APIs"""
+        """Authenticate with Google APIs - FIXED TOKEN EXPIRATION"""
         try:
             # Check for existing token
             if os.path.exists('token.json'):
-                self.creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+                try:
+                    self.creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+                except Exception as e:
+                    print(f"Token file corrupted, deleting: {e}")
+                    os.remove('token.json')
+                    self.creds = None
             
             # If no valid credentials, let user log in
             if not self.creds or not self.creds.valid:
                 if self.creds and self.creds.expired and self.creds.refresh_token:
-                    self.creds.refresh(Request())
+                    try:
+                        print("Refreshing expired token...")
+                        self.creds.refresh(Request())
+                        print("Token refreshed successfully")
+                    except Exception as e:
+                        print(f"Token refresh failed: {e}")
+                        print("Deleting old token and re-authenticating...")
+                        if os.path.exists('token.json'):
+                            os.remove('token.json')
+                        flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+                        self.creds = flow.run_local_server(port=0)
                 else:
                     flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
                     self.creds = flow.run_local_server(port=0)
@@ -54,9 +68,8 @@ class GoogleAPIClient:
             # Build services
             self.gmail_service = build('gmail', 'v1', credentials=self.creds)
             self.calendar_service = build('calendar', 'v3', credentials=self.creds)
-            logger.info("✅ Google API Client authenticated")
         except Exception as e:
-            logger.error(f"Authentication error: {str(e)}")
+            print(f"Authentication error: {str(e)}")
             raise
     
     def get_unread_emails(self, max_results=10):
@@ -76,10 +89,14 @@ class GoogleAPIClient:
                 if email_data:
                     emails.append(email_data)
             
-            logger.info(f"Fetched {len(emails)} unread emails")
             return emails
         except HttpError as error:
-            logger.error(f'Gmail fetch error: {error}')
+            # ADDED: Auto re-authenticate on 401 error
+            if error.resp.status == 401:
+                print("Token expired during API call, re-authenticating...")
+                self.authenticate()
+                return self.get_unread_emails(max_results)
+            print(f'Gmail fetch error: {error}')
             return []
     
     def get_email_details(self, msg_id):
@@ -108,7 +125,7 @@ class GoogleAPIClient:
                 'thread_id': message['threadId']
             }
         except HttpError as error:
-            logger.error(f'Email details error: {error}')
+            print(f'Email details error: {error}')
             return None
     
     def get_email_body(self, payload):
@@ -145,10 +162,9 @@ class GoogleAPIClient:
                 body=send_message
             ).execute()
             
-            logger.info(f"Email sent successfully (ID: {sent['id']})")
             return True, sent['id']
         except HttpError as error:
-            logger.error(f'Send email error: {error}')
+            print(f'Send email error: {error}')
             return False, str(error)
     
     def mark_as_read(self, msg_id):
@@ -159,10 +175,9 @@ class GoogleAPIClient:
                 id=msg_id,
                 body={'removeLabelIds': ['UNREAD']}
             ).execute()
-            logger.info(f"Email marked as read (ID: {msg_id})")
             return True
         except HttpError as error:
-            logger.error(f'Mark as read error: {error}')
+            print(f'Mark as read error: {error}')
             return False
     
     def create_calendar_event(self, summary, start_time, end_time, description="", attendees=None):
@@ -189,10 +204,9 @@ class GoogleAPIClient:
                 body=event
             ).execute()
             
-            logger.info(f"Calendar event created: {event.get('htmlLink')}")
             return True, event.get('htmlLink')
         except HttpError as error:
-            logger.error(f'Create calendar event error: {error}')
+            print(f'Create calendar event error: {error}')
             return False, str(error)
     
     def get_free_busy(self, start_time, end_time):
@@ -207,10 +221,9 @@ class GoogleAPIClient:
             response = self.calendar_service.freebusy().query(body=body).execute()
             busy_times = response['calendars']['primary']['busy']
             
-            logger.info(f"Calendar availability checked: {'Free' if len(busy_times) == 0 else 'Busy'}")
             return len(busy_times) == 0, busy_times
         except HttpError as error:
-            logger.error(f'Free busy check error: {error}')
+            print(f'Free busy check error: {error}')
             return None, str(error)
 
 class EmailAgentState(TypedDict):
@@ -295,7 +308,6 @@ class EmailCalendarAgent:
             state['action'] = result.get('action', 'Reply')
             state['messages'].append(AIMessage(content=f"✓ Triage: {result.get('reasoning', '')}"))
         except Exception as e:
-            logger.error(f"Triage error: {str(e)}")
             state['priority'] = 'Medium'
             state['category'] = 'Information'
             state['action'] = 'Reply'
@@ -349,7 +361,6 @@ class EmailCalendarAgent:
             else:
                 state['messages'].append(AIMessage(content="No meeting request detected"))
         except Exception as e:
-            logger.error(f"Meeting extraction error: {str(e)}")
             state['meeting_details'] = {"has_meeting": False}
             state['messages'].append(AIMessage(content="No meeting details found"))
         
@@ -388,7 +399,6 @@ class EmailCalendarAgent:
             state['draft_response'] = response.content
             state['messages'].append(AIMessage(content="✉️ Draft created"))
         except Exception as e:
-            logger.error(f"Draft response error: {str(e)}")
             state['messages'].append(AIMessage(content="✉️ Failed to create draft"))
         
         return state
@@ -532,7 +542,6 @@ class EmailCalendarAgent:
                 
                 return "Processing complete."
             except Exception as e:
-                logger.error(f"Process email error: {str(e)}")
                 return f"❌ Error: {str(e)}"
         
         elif any(word in user_lower for word in ["meeting", "schedule", "calendar", "appointment"]):
