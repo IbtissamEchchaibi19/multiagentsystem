@@ -1,4 +1,4 @@
-# Weather Agent (LangGraph + 3 tools)
+# Weather Agent (LangGraph + 3 tools + Conversation Memory)
 
 import json
 import requests
@@ -7,10 +7,11 @@ from datetime import datetime
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langchain_core.tools import tool
-from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage
+from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage, AIMessage
 import operator
 from dotenv import load_dotenv
 import os
+
 load_dotenv()
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 
@@ -85,13 +86,20 @@ class WeatherAgentState(TypedDict):
     iteration: int
 
 class WeatherAgent:
-    """Weather Agent with LangGraph and Tools"""
+    """Weather Agent with LangGraph and Conversation Memory"""
     
     def __init__(self, llm):
         self.llm = llm
         self.tools = [get_current_weather, get_weather_forecast, compare_weather]
         self.llm_with_tools = llm.bind_tools(self.tools)
         self.graph = self._build_graph()
+        
+        # Conversation memory - stores all messages across interactions
+        self.conversation_history: List[AnyMessage] = [
+            SystemMessage(content="You are a helpful weather assistant with access to weather tools. "
+                                "You can check current weather, forecasts, and compare cities. "
+                                "Remember previous questions in the conversation and provide contextual responses.")
+        ]
     
     def _build_graph(self):
         workflow = StateGraph(WeatherAgentState)
@@ -113,10 +121,6 @@ class WeatherAgent:
     
     def _agent_node(self, state: WeatherAgentState) -> WeatherAgentState:
         messages = state["messages"]
-        if len(messages) == 1:
-            system_msg = SystemMessage(content="You are a weather assistant with access to weather tools. Use them to help users.")
-            messages = [system_msg] + messages
-        
         response = self.llm_with_tools.invoke(messages)
         return {"messages": [response], "iteration": state.get("iteration", 0) + 1}
     
@@ -129,13 +133,33 @@ class WeatherAgent:
         return "end"
     
     def process(self, user_input: str) -> str:
-        """Process weather query"""
+        """Process weather query with conversation memory"""
+        # Add user message to history
+        self.conversation_history.append(HumanMessage(content=user_input))
+        
+        # Run graph with full conversation history
         state = {
-            "messages": [HumanMessage(content=user_input)],
+            "messages": self.conversation_history.copy(),
             "iteration": 0
         }
         
         result = self.graph.invoke(state)
-        final_message = result["messages"][-1]
         
+        # Extract all new messages from this interaction (excluding the history we passed in)
+        new_messages = result["messages"][len(self.conversation_history):]
+        
+        # Add new messages to conversation history
+        self.conversation_history.extend(new_messages)
+        
+        # Get final response
+        final_message = result["messages"][-1]
         return final_message.content if hasattr(final_message, "content") else str(final_message)
+    
+    def clear_history(self):
+        """Clear conversation history (keep only system message)"""
+        self.conversation_history = [self.conversation_history[0]]
+    
+    def get_history(self) -> List[AnyMessage]:
+        """Get current conversation history"""
+        return self.conversation_history.copy()
+

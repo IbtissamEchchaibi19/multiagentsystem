@@ -1,5 +1,5 @@
 # Email & Calendar Agent with Real Gmail & Google Calendar Integration
-# ONLY TOKEN EXPIRATION FIX APPLIED
+# FIXED: Context maintenance, conversation flow, and confirmation system
 
 import os
 import json
@@ -91,7 +91,7 @@ class GoogleAPIClient:
             
             return emails
         except HttpError as error:
-            # ADDED: Auto re-authenticate on 401 error
+            # Auto re-authenticate on 401 error
             if error.resp.status == 401:
                 print("Token expired during API call, re-authenticating...")
                 self.authenticate()
@@ -249,6 +249,13 @@ class EmailCalendarAgent:
         self.llm = llm
         self.google_client = GoogleAPIClient()
         self.graph = self._build_graph()
+        
+        # NEW: State management for conversation context
+        self.current_email = None  # Stores the selected email
+        self.cached_emails = []     # Stores the last fetched email list
+        self.draft_ready = None     # Stores the current draft
+        self.meeting_ready = None   # Stores meeting details pending confirmation
+        self.last_state = None      # Stores the last graph execution state
     
     def _build_graph(self):
         """Create the email processing workflow"""
@@ -492,72 +499,198 @@ class EmailCalendarAgent:
         return state
     
     def process(self, user_input: str) -> str:
-        """Process email/calendar requests"""
+        """Process email/calendar requests with context awareness"""
         user_lower = user_input.lower().strip()
         
-        if any(word in user_lower for word in ["email", "inbox", "unread"]):
-            emails = self.google_client.get_unread_emails(max_results=20)
-            if not emails:
-                return "No unread emails found."
+        # CONFIRMATION HANDLERS
+        if user_lower in ["yes", "y", "confirm", "send", "send it"]:
+            if self.draft_ready:
+                success, result = self.google_client.send_email(
+                    to=self.current_email['sender'],
+                    subject=self.current_email['subject'],
+                    body=self.draft_ready,
+                    thread_id=self.current_email.get('thread_id')
+                )
+                msg = f"✅ Reply sent successfully! (ID: {result})" if success else f"❌ Failed to send: {result}"
+                if success:
+                    self.google_client.mark_as_read(self.current_email['id'])
+                    self.current_email = None  # Clear after sending
+                self.draft_ready = None
+                return msg
             
-            email_list = []
-            for i, email in enumerate(emails, 1):
-                email_list.append(f"{i}. From: {email['sender']}\n   Subject: {email['subject']}\n")
+            elif self.meeting_ready:
+                mtg = self.meeting_ready
+                try:
+                    start_time = datetime.fromisoformat(f"{mtg['proposed_date']}T{mtg['proposed_time']}:00")
+                    end_time = start_time + timedelta(minutes=mtg.get('duration_minutes', 60))
+                    
+                    success, result = self.google_client.create_calendar_event(
+                        summary=mtg.get('topic', self.current_email['subject']),
+                        start_time=start_time,
+                        end_time=end_time,
+                        description=f"Meeting with {self.current_email['sender']}",
+                        attendees=[self.current_email['sender']]
+                    )
+                    
+                    msg = f"✅ Meeting scheduled! {result}" if success else f"❌ Failed: {result}"
+                    self.meeting_ready = None
+                    return msg
+                except Exception as e:
+                    return f"❌ Error scheduling meeting: {str(e)}"
             
+            else:
+                return "❌ Nothing to confirm. Please select an email first or request a draft."
+        
+        if user_lower in ["no", "n", "cancel", "skip"]:
+            self.draft_ready = None
+            self.meeting_ready = None
+            return "❌ Cancelled. What would you like to do next?"
+        
+        # LIST EMAILS
+        if any(word in user_lower for word in ["check", "show", "list"]) and any(word in user_lower for word in ["email", "inbox", "unread"]):
+            self.cached_emails = self.google_client.get_unread_emails(max_results=20)
+            if not self.cached_emails:
+                return "📭 No unread emails found."
+            
+            email_list = ["📬 **Your Unread Emails:**\n"]
+            for i, email in enumerate(self.cached_emails, 1):
+                email_list.append(f"{i}. **From:** {email['sender']}\n   **Subject:** {email['subject']}\n")
+            
+            email_list.append("\n💡 Type a number to select an email (e.g., '1' or 'select 3')")
             return "\n".join(email_list)
         
-        elif any(word in user_lower for word in ["process", "read", "reply"]) and re.search(r'\d+', user_lower):
+        # SELECT EMAIL BY NUMBER
+        match = re.search(r'\b(\d+)\b', user_input)
+        if match and not any(word in user_lower for word in ["reply", "draft", "schedule"]):
             try:
-                email_index = int(re.search(r'\d+', user_lower).group()) - 1
-                emails = self.google_client.get_unread_emails(max_results=20)
-                if email_index < 0 or email_index >= len(emails):
-                    return "Invalid email index."
+                email_index = int(match.group(1)) - 1
                 
-                email = emails[email_index]
-                send_reply = "reply" in user_lower
-                create_event = "schedule" in user_lower or "meeting" in user_lower
+                # Fetch emails if not cached
+                if not self.cached_emails:
+                    self.cached_emails = self.google_client.get_unread_emails(max_results=20)
                 
-                initial_state = {
-                    "messages": [],
-                    "email_id": email['id'],
-                    "thread_id": email['thread_id'],
-                    "email_content": email['body'],
-                    "sender": email['sender'],
-                    "subject": email['subject'],
-                    "priority": "",
-                    "category": "",
-                    "action": "",
-                    "draft_response": "",
-                    "meeting_details": {},
-                    "send_reply": send_reply,
-                    "create_event": create_event,
-                    "google_client": self.google_client
-                }
+                if email_index < 0 or email_index >= len(self.cached_emails):
+                    return f"❌ Invalid selection. Please choose 1-{len(self.cached_emails)}"
                 
-                result = self.graph.invoke(initial_state)
+                self.current_email = self.cached_emails[email_index]
                 
-                for msg in reversed(result['messages']):
-                    if isinstance(msg, AIMessage) and "Email Processing Complete" in msg.content:
-                        return msg.content
+                # Show full email content
+                preview = self.current_email['body'][:500] + ("..." if len(self.current_email['body']) > 500 else "")
                 
-                return "Processing complete."
+                return (f"📧 **Email Selected:**\n\n"
+                       f"**From:** {self.current_email['sender']}\n"
+                       f"**Subject:** {self.current_email['subject']}\n"
+                       f"**Date:** {self.current_email['date']}\n\n"
+                       f"**Content Preview:**\n{preview}\n\n"
+                       f"💡 What would you like to do?\n"
+                       f"• Type 'draft reply' to create a response\n"
+                       f"• Type 'full content' to see the complete email\n"
+                       f"• Type 'analyze' to get AI insights")
+            
             except Exception as e:
-                return f"❌ Error: {str(e)}"
+                return f"❌ Error selecting email: {str(e)}"
         
-        elif any(word in user_lower for word in ["meeting", "schedule", "calendar", "appointment"]):
-            return ("📅 **Calendar Management**\n\n"
-                   "I can help you:\n"
-                   "• Schedule new meetings\n"
-                   "• Check calendar availability\n"
-                   "• Create calendar events\n"
-                   "• Send meeting invites\n\n"
-                   "Try: 'Schedule a meeting for tomorrow at 3pm'")
+        # SHOW FULL CONTENT OF CURRENT EMAIL
+        if user_lower in ["full", "full content", "show all", "read all"]:
+            if not self.current_email:
+                return "❌ No email selected. Please select an email first."
+            
+            return (f"📧 **Full Email:**\n\n"
+                   f"**From:** {self.current_email['sender']}\n"
+                   f"**Subject:** {self.current_email['subject']}\n"
+                   f"**Date:** {self.current_email['date']}\n\n"
+                   f"**Full Content:**\n{self.current_email['body']}")
         
-        else:
+        # ANALYZE CURRENT EMAIL
+        if "analyze" in user_lower:
+            if not self.current_email:
+                return "❌ No email selected. Please select an email first."
+            
+            initial_state = {
+                "messages": [],
+                "email_id": self.current_email['id'],
+                "thread_id": self.current_email['thread_id'],
+                "email_content": self.current_email['body'],
+                "sender": self.current_email['sender'],
+                "subject": self.current_email['subject'],
+                "priority": "",
+                "category": "",
+                "action": "",
+                "draft_response": "",
+                "meeting_details": {},
+                "send_reply": False,
+                "create_event": False,
+                "google_client": self.google_client
+            }
+            
+            result = self.graph.invoke(initial_state)
+            self.last_state = result
+            
+            analysis = (f"🔍 **Email Analysis:**\n\n"
+                       f"**Priority:** {result['priority']}\n"
+                       f"**Category:** {result['category']}\n"
+                       f"**Recommended Action:** {result['action']}\n")
+            
+            if result.get('meeting_details', {}).get('has_meeting'):
+                mtg = result['meeting_details']
+                analysis += (f"\n📅 **Meeting Detected:**\n"
+                           f"• Topic: {mtg.get('topic', 'N/A')}\n"
+                           f"• Date: {mtg.get('proposed_date', 'N/A')}\n"
+                           f"• Time: {mtg.get('proposed_time', 'N/A')}\n"
+                           f"• Available: {'✅ Yes' if mtg.get('is_available') else '❌ Conflict'}\n")
+            
+            return analysis
+        
+        # DRAFT REPLY FOR CURRENT EMAIL
+        if any(word in user_lower for word in ["draft", "reply", "respond"]):
+            if not self.current_email:
+                return "❌ No email selected. Please select an email first."
+            
+            initial_state = {
+                "messages": [],
+                "email_id": self.current_email['id'],
+                "thread_id": self.current_email['thread_id'],
+                "email_content": self.current_email['body'],
+                "sender": self.current_email['sender'],
+                "subject": self.current_email['subject'],
+                "priority": "",
+                "category": "",
+                "action": "",
+                "draft_response": "",
+                "meeting_details": {},
+                "send_reply": False,
+                "create_event": False,
+                "google_client": self.google_client
+            }
+            
+            result = self.graph.invoke(initial_state)
+            self.last_state = result
+            self.draft_ready = result.get('draft_response', '')
+            self.meeting_ready = result.get('meeting_details') if result.get('meeting_details', {}).get('has_meeting') else None
+            
+            response = f"✉️ **Draft Reply:**\n\n{self.draft_ready}\n\n"
+            
+            if self.meeting_ready and self.meeting_ready.get('is_available'):
+                response += (f"📅 **Meeting to Schedule:**\n"
+                           f"• {self.meeting_ready.get('topic')}\n"
+                           f"• {self.meeting_ready.get('proposed_date')} at {self.meeting_ready.get('proposed_time')}\n\n")
+            
+            response += "💡 Type 'yes' to send, 'no' to cancel, or 'edit' to modify"
+            
+            return response
+        
+        # DEFAULT HELP
+        if not self.cached_emails:
             return ("📧📅 **Email & Calendar Assistant**\n\n"
                    "I can help with:\n"
                    "• Managing your Gmail inbox\n"
                    "• Scheduling meetings and events\n"
-                   "• Checking calendar availability\n"
-                   "• Sending email replies\n\n"
-                   "Try: 'Check my emails' or 'Process email 1'")
+                   "• Drafting and sending replies\n\n"
+                   "💡 Try: 'Check my emails' to get started")
+        else:
+            return ("💡 **Available commands:**\n"
+                   "• Select an email by number (1, 2, 3...)\n"
+                   "• 'draft reply' - Create a response\n"
+                   "• 'full content' - See complete email\n"
+                   "• 'analyze' - Get AI insights\n"
+                   "• 'check emails' - Refresh inbox")
