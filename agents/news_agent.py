@@ -1,4 +1,4 @@
-# News Intelligence Agent (7 sub-agents) - WITH CONTEXT MAINTENANCE
+# News Intelligence Agent - WITH IMAGE/VIDEO DISPLAY SUPPORT
 
 import json
 from dotenv import load_dotenv
@@ -48,11 +48,12 @@ class NewsAgentState(TypedDict):
     conversation_context: Dict
     user_intent: str
     follow_up_needed: bool
-    is_follow_up: bool  # NEW: Track if this is a follow-up question
+    is_follow_up: bool
+    media_urls: List[str]  # NEW: Store media URLs for display
 
 
 class NewsIntelligenceAgent:
-    """Complete News Intelligence System with specialized sub-agents and CONTEXT MAINTENANCE"""
+    """Complete News Intelligence System with Image/Video Display"""
     
     def __init__(self, llm):
         self.llm = llm
@@ -96,15 +97,13 @@ class NewsIntelligenceAgent:
         last_message = state["messages"][-1]["content"].lower()
         context = state["conversation_context"]
         
-        # Check for follow-up indicators
         follow_up_words = [
             "tell me more", "more about", "what about", "about the", 
             "first one", "second one", "third", "number", "article",
             "that place", "that product", "this video", "the paper",
-            "link", "detail", "explain", "summarize"
+            "link", "detail", "explain", "summarize", "show me"
         ]
         
-        # Check if context has stored results
         has_context = any([
             context.get('current_articles'),
             context.get('current_papers'),
@@ -121,7 +120,6 @@ class NewsIntelligenceAgent:
     def _router_agent(self, state: NewsAgentState) -> NewsAgentState:
         last_message = state["messages"][-1]["content"]
         
-        # Check if this is a follow-up question about existing results
         if self._check_for_follow_up(state):
             state["current_agent"] = "deepdive_agent"
             state["is_follow_up"] = True
@@ -155,7 +153,6 @@ Return JSON: {{"agent": "agent_name", "reasoning": "why"}}"""
             routing = json.loads(content)
             state["current_agent"] = routing["agent"]
         except:
-            # Fallback keyword routing
             last_lower = last_message.lower()
             if any(w in last_lower for w in ["news", "today", "latest", "breaking"]):
                 state["current_agent"] = "news_agent"
@@ -165,7 +162,7 @@ Return JSON: {{"agent": "agent_name", "reasoning": "why"}}"""
                 state["current_agent"] = "local_agent"
             elif any(w in last_lower for w in ["buy", "price", "shop", "product"]):
                 state["current_agent"] = "shopping_agent"
-            elif any(w in last_lower for w in ["image", "video", "photo"]):
+            elif any(w in last_lower for w in ["image", "video", "photo", "picture"]):
                 state["current_agent"] = "media_agent"
             else:
                 state["current_agent"] = "web_agent"
@@ -179,8 +176,6 @@ Return JSON: {{"agent": "agent_name", "reasoning": "why"}}"""
         if news_results["success"]:
             articles = news_results["data"].get("news", [])
             state["search_results"] = news_results
-            
-            # STORE IN CONTEXT for later retrieval
             state["conversation_context"]["current_articles"] = articles
             state["conversation_context"]["last_search_type"] = "news"
             state["conversation_context"]["last_query"] = last_message
@@ -207,8 +202,6 @@ Return JSON: {{"agent": "agent_name", "reasoning": "why"}}"""
         
         if scholar_results["success"]:
             papers = scholar_results["data"].get("organic", [])
-            
-            # STORE IN CONTEXT
             state["conversation_context"]["current_papers"] = papers
             state["conversation_context"]["last_search_type"] = "research"
             state["conversation_context"]["last_query"] = last_message
@@ -235,8 +228,6 @@ Return JSON: {{"agent": "agent_name", "reasoning": "why"}}"""
         
         if places_results["success"]:
             places = places_results["data"].get("places", [])
-            
-            # STORE IN CONTEXT
             state["conversation_context"]["current_places"] = places
             state["conversation_context"]["last_search_type"] = "places"
             state["conversation_context"]["last_query"] = last_message
@@ -264,8 +255,6 @@ Return JSON: {{"agent": "agent_name", "reasoning": "why"}}"""
         
         if shopping_results["success"]:
             products = shopping_results["data"].get("shopping", [])
-            
-            # STORE IN CONTEXT
             state["conversation_context"]["current_products"] = products
             state["conversation_context"]["last_search_type"] = "shopping"
             state["conversation_context"]["last_query"] = last_message
@@ -278,6 +267,9 @@ Return JSON: {{"agent": "agent_name", "reasoning": "why"}}"""
                 response_text += f"   🪐 Source: {product.get('source', 'Unknown')}\n"
                 if product.get('link'):
                     response_text += f"   🔗 {product.get('link')}\n"
+                # NEW: Store product images if available
+                if product.get('imageUrl'):
+                    response_text += f"   🖼️ Image available\n"
                 response_text += "\n"
             
             response_text += "💡 *Ask me about any product for more details!*"
@@ -288,27 +280,52 @@ Return JSON: {{"agent": "agent_name", "reasoning": "why"}}"""
         return state
     
     def _media_agent(self, state: NewsAgentState) -> NewsAgentState:
+        """Media agent with ACTUAL image/video URL extraction"""
         last_message = state["messages"][-1]["content"]
         search_type = "videos" if "video" in last_message.lower() else "images"
         results = SerperAPI.search(last_message, search_type, 10)
         
         if results["success"]:
             items = results["data"].get(search_type, [])
-            
-            # STORE IN CONTEXT
             state["conversation_context"]["current_media"] = items
             state["conversation_context"]["last_search_type"] = search_type
             state["conversation_context"]["last_query"] = last_message
+            
+            # Extract media URLs for display
+            media_urls = []
             
             response_text = f"🎬 **Found {len(items)} {search_type}**\n\n"
             
             for i, item in enumerate(items[:5], 1):
                 response_text += f"**{i}. {item.get('title', 'No title')}**\n"
-                if item.get('link'):
-                    response_text += f"   🔗 {item.get('link')}\n"
+                
+                # For images: Extract imageUrl
+                if search_type == "images" and item.get('imageUrl'):
+                    image_url = item.get('imageUrl')
+                    media_urls.append(image_url)
+                    response_text += f"   🖼️ Image URL: {image_url}\n"
+                    response_text += f"   📏 Size: {item.get('imageWidth', 'N/A')}x{item.get('imageHeight', 'N/A')}\n"
+                
+                # For videos: Extract link
+                elif search_type == "videos" and item.get('link'):
+                    video_url = item.get('link')
+                    media_urls.append(video_url)
+                    response_text += f"   🎥 Video URL: {video_url}\n"
+                    response_text += f"   ⏱️ Duration: {item.get('duration', 'N/A')}\n"
+                    response_text += f"   📅 Date: {item.get('date', 'N/A')}\n"
+                
+                if item.get('source'):
+                    response_text += f"   📌 Source: {item.get('source')}\n"
+                
                 response_text += "\n"
             
-            response_text += "💡 *Ask me about any item for more details!*"
+            # Store media URLs in state
+            state["media_urls"] = media_urls
+            state["conversation_context"]["media_urls"] = media_urls
+            
+            response_text += f"\n💡 *Found {len(media_urls)} media URLs. Ask about specific items for more details!*"
+            response_text += f"\n\n📋 **To display {search_type}:** Use the URLs above in your UI/frontend."
+            
             state["messages"].append({"role": "assistant", "content": response_text})
         else:
             state["messages"].append({"role": "assistant", "content": f"❌ No {search_type} found."})
@@ -321,8 +338,6 @@ Return JSON: {{"agent": "agent_name", "reasoning": "why"}}"""
         
         if web_results["success"]:
             results = web_results["data"].get("organic", [])
-            
-            # STORE IN CONTEXT
             state["conversation_context"]["current_results"] = results
             state["conversation_context"]["last_search_type"] = "web"
             state["conversation_context"]["last_query"] = last_message
@@ -344,11 +359,11 @@ Return JSON: {{"agent": "agent_name", "reasoning": "why"}}"""
         return state
     
     def _deepdive_agent(self, state: NewsAgentState) -> NewsAgentState:
-        """Handle follow-up questions about previously retrieved content"""
+        """Handle follow-up questions with MEDIA DISPLAY support"""
         last_message = state["messages"][-1]["content"].lower()
         context = state["conversation_context"]
         
-        # Extract item number if mentioned (e.g., "first", "second", "1", "2")
+        # Extract item number
         item_index = None
         number_words = {
             "first": 0, "1": 0, "one": 0,
@@ -363,7 +378,7 @@ Return JSON: {{"agent": "agent_name", "reasoning": "why"}}"""
                 item_index = idx
                 break
         
-        # Retrieve appropriate stored results
+        # Retrieve stored results
         search_type = context.get("last_search_type", "")
         stored_items = None
         
@@ -385,23 +400,42 @@ Return JSON: {{"agent": "agent_name", "reasoning": "why"}}"""
             state["messages"].append({"role": "assistant", "content": response})
             return state
         
-        # If specific item requested
+        # Show specific item details
         if item_index is not None and item_index < len(stored_items):
             item = stored_items[item_index]
             response_text = f"📋 **Details about item #{item_index + 1}:**\n\n"
             response_text += f"**Title:** {item.get('title', 'No title')}\n"
             
+            # Handle different content types
             if search_type == "news":
                 response_text += f"**Source:** {item.get('source', 'Unknown')}\n"
                 response_text += f"**Date:** {item.get('date', 'N/A')}\n"
-                response_text += f"**Summary:** {item.get('snippet', 'No summary available')}\n"
+                response_text += f"**Summary:** {item.get('snippet', 'No summary')}\n"
+            
             elif search_type == "places":
                 response_text += f"**Rating:** {item.get('rating', 'N/A')} ⭐\n"
                 response_text += f"**Address:** {item.get('address', 'N/A')}\n"
                 response_text += f"**Phone:** {item.get('phoneNumber', 'N/A')}\n"
+            
             elif search_type == "shopping":
                 response_text += f"**Price:** {item.get('price', 'N/A')}\n"
                 response_text += f"**Source:** {item.get('source', 'Unknown')}\n"
+                if item.get('imageUrl'):
+                    response_text += f"**Product Image:** {item.get('imageUrl')}\n"
+            
+            elif search_type == "images":
+                response_text += f"**Image URL:** {item.get('imageUrl', 'N/A')}\n"
+                response_text += f"**Dimensions:** {item.get('imageWidth', 'N/A')}x{item.get('imageHeight', 'N/A')}\n"
+                response_text += f"**Source:** {item.get('source', 'Unknown')}\n"
+                response_text += f"\n🖼️ **Display this image in your UI using the URL above**"
+            
+            elif search_type == "videos":
+                response_text += f"**Video URL:** {item.get('link', 'N/A')}\n"
+                response_text += f"**Duration:** {item.get('duration', 'N/A')}\n"
+                response_text += f"**Channel:** {item.get('channel', 'Unknown')}\n"
+                response_text += f"**Date:** {item.get('date', 'N/A')}\n"
+                response_text += f"\n🎥 **Display this video in your UI using the URL above**"
+            
             else:
                 response_text += f"**Description:** {item.get('snippet', 'No description')}\n"
             
@@ -410,15 +444,19 @@ Return JSON: {{"agent": "agent_name", "reasoning": "why"}}"""
             
             state["messages"].append({"role": "assistant", "content": response_text})
         
-        # General overview of all items
+        # Show overview
         else:
-            response_text = f"📚 **You have {len(stored_items)} {search_type} results from your search: '{context.get('last_query', '')}'**\n\n"
-            response_text += "Here's what I found:\n\n"
+            response_text = f"📚 **You have {len(stored_items)} {search_type} results**\n\n"
+            response_text += f"From search: '{context.get('last_query', '')}'\n\n"
             
             for i, item in enumerate(stored_items[:5], 1):
                 response_text += f"{i}. {item.get('title', 'No title')}\n"
             
-            response_text += f"\n💡 *Ask about a specific item (e.g., 'tell me about the first one') for more details!*"
+            if search_type in ["images", "videos"]:
+                media_urls = context.get("media_urls", [])
+                response_text += f"\n🎬 **{len(media_urls)} media URLs available**"
+            
+            response_text += f"\n\n💡 *Ask about a specific item (e.g., 'show me the first one') for details!*"
             state["messages"].append({"role": "assistant", "content": response_text})
         
         return state
@@ -432,7 +470,8 @@ Return JSON: {{"agent": "agent_name", "reasoning": "why"}}"""
             "conversation_context": conversation_state,
             "user_intent": "",
             "follow_up_needed": False,
-            "is_follow_up": False
+            "is_follow_up": False,
+            "media_urls": []
         }
         
         result = self.graph.invoke(initial_state)
