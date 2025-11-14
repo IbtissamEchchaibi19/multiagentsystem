@@ -22,3 +22,4 @@ requests
 urllib3
 uvicorn
 boto3
+python-multipart
