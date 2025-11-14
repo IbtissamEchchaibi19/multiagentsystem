@@ -21,3 +21,4 @@ python-dotenv
 requests
 urllib3
 uvicorn
+boto3
